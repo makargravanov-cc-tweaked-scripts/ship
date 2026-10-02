@@ -278,6 +278,18 @@ while true do
                     __continue5 = true
                     break
                 end
+                if c.to ~= cfg.ecuId and c.to ~= "all" then
+                    __continue5 = true
+                    break
+                end
+                if c.to == "all" and c.seq <= 0 then
+                    thr.setThrustNormalized(0)
+                    thr.setVector(0, 0)
+                    applied = 0
+                    lastClock = now
+                    __continue5 = true
+                    break
+                end
                 if c.seq <= lastSeq then
                     __continue5 = true
                     break

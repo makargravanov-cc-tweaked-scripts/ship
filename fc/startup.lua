@@ -170,7 +170,9 @@ function ____exports.axisOf(self, id)
     end
     return vector.new(1, 0, 0)
 end
---- Распределить desired force body (Fx,Fy,Fz) + yaw torque Tz по 16 дросселям.
+--- Распределить desired force body (Fx,Fy,Fz) + yaw torque на 16 дросселей.
+-- Возвращает throttle 0..1 в порядке ECU_IDS.
+-- Конвенция: f — это ДОБАВКА сверх hover (hover отдельно).
 function ____exports.mix(self, f, yaw, hover)
     local out = {}
     for ____, id in ipairs(____exports.ECU_IDS) do
@@ -278,6 +280,7 @@ function ____exports.bootState(self, modem)
             modem.transmit(proto.CH_CMD, proto.CH_STATUS, {
                 kind = "force_cmd",
                 seq = 0,
+                to = "all",
                 throttle = 0,
                 vecX = 0,
                 vecY = 0
@@ -308,6 +311,19 @@ function ____exports.bootState(self, modem)
 end
 return ____exports
  end,
+["fc.calib"] = function(...) 
+--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
+local ____exports = {}
+____exports.CAL_PATH = "fc_cal.json"
+function ____exports.loadCal(self, loadJson)
+    local c = loadJson(nil, ____exports.CAL_PATH)
+    if c ~= nil and c.hover > 0.2 and c.hover < 5 then
+        return c
+    end
+    return {hover = 1}
+end
+return ____exports
+ end,
 ["fc.main"] = function(...) 
 --[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 -- Lua Library inline imports
@@ -322,28 +338,33 @@ local proto = require("ship.proto")
 local pid = require("ship.pid")
 local ctl = require("fc.control")
 local boot = require("fc.boot")
+local calib = require("fc.calib")
 local modem = boot:openModem()
 local fc = boot:bootState(modem)
 local function saveFc(self)
     boot:saveJson(ctl.FC_STATE, fc)
 end
+local cal = calib:loadCal(boot.loadJson)
+local function saveCal(self)
+    boot:saveJson(calib.CAL_PATH, cal)
+end
 local posPid = __TS__New(pid.Pid3, {
-    kp = 0.6,
-    ki = 0.02,
-    kd = 0.25,
-    iMin = -3,
-    iMax = 3,
-    oMin = -ctl.VMAX,
-    oMax = ctl.VMAX
-})
-local velPid = __TS__New(pid.Pid3, {
-    kp = 0.8,
-    ki = 0.05,
-    kd = 0.15,
+    kp = 0.35,
+    ki = 0,
+    kd = 0.2,
     iMin = -2,
     iMax = 2,
-    oMin = -1,
-    oMax = 1
+    oMin = -3,
+    oMax = 3
+})
+local velPid = __TS__New(pid.Pid3, {
+    kp = 0.25,
+    ki = 0.08,
+    kd = 0.12,
+    iMin = -0.4,
+    iMax = 0.4,
+    oMin = -0.5,
+    oMax = 0.5
 })
 local yawPid = __TS__New(pid.Pid, {
     kp = 0.8,
@@ -397,18 +418,14 @@ local function loop(self)
         local hoverBase = math.min(
             0.9,
             math.max(
-                0.05,
-                mass * math.abs(grav.y) / 1000 / 4
+                0,
+                cal.hover * mass * math.abs(grav.y) / 1000 / 4
             )
         )
         local sp = setpoint(nil)
         local velCmd = posPid:step(sp, pose.position, dt)
         local forceW = velPid:step(velCmd, linV, dt)
-        local ff = vector.new(0, -grav.y * mass / 1000, 0)
-        local fB = ctl:worldToBody(
-            pose.orientation,
-            forceW:add(ff)
-        )
+        local fB = ctl:worldToBody(pose.orientation, forceW)
         local yawE = ctl:yawError(pose.orientation, qHold)
         local yawT = yawPid:step(0, -yawE, dt)
         local th = ctl:mix(fB, yawT, hoverBase)
@@ -428,6 +445,7 @@ local function loop(self)
                 modem.transmit(proto.CH_CMD, proto.CH_STATUS, {
                     kind = "force_cmd",
                     seq = seq,
+                    to = ctl.ECU_IDS[i + 1],
                     throttle = th[i + 1] or 0,
                     vecX = 0,
                     vecY = 0
@@ -501,9 +519,21 @@ local function console_(self)
             print("fc: ABORT")
         elseif c == "status" then
             local p = sublevel.getLogicalPose().position
-            print((((((((("pos " .. tostring(p.x)) .. " ") .. tostring(p.y)) .. " ") .. tostring(p.z)) .. " phase=") .. fc.phase) .. " wp=") .. tostring(#fc.waypoints))
+            print((((((((((("pos " .. tostring(p.x)) .. " ") .. tostring(p.y)) .. " ") .. tostring(p.z)) .. " phase=") .. fc.phase) .. " wp=") .. tostring(#fc.waypoints)) .. " calHover=") .. tostring(cal.hover))
+        elseif c == "calib" then
+            local v = tonumber(cmd[2] or "")
+            if v == nil then
+                print(("calib " .. tostring(cal.hover)) .. " (usage: calib 0.5..2.0)")
+            else
+                cal.hover = math.max(
+                    0.3,
+                    math.min(3, v)
+                )
+                saveCal(nil)
+                print(("calib hover=" .. tostring(cal.hover)) .. " — проверь вис, повтори при сносе")
+            end
         elseif c == "help" or c == "?" or c == "" then
-            print("hold | hover [y] | goto x y z | route .. | abort | status")
+            print("hold | hover [y] | goto x y z | route .. | abort | status | calib k")
         elseif c == "route" then
             if (#cmd - 1) % 3 ~= 0 then
                 print("usage: route x1 y1 z1 [x2 y2 z2 ...]")
