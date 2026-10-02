@@ -128,6 +128,13 @@ local function __TS__StringEndsWith(self, searchString, endPosition)
     end
     return string.sub(self, endPosition - #searchString + 1, endPosition) == searchString
 end
+
+local function __TS__StringStartsWith(self, searchString, position)
+    if position == nil or position < 0 then
+        position = 0
+    end
+    return string.sub(self, position + 1, #searchString + position) == searchString
+end
 -- End of Lua Library inline imports
 local ____exports = {}
 ____exports.FC_STATE = "fc_state.json"
@@ -170,32 +177,100 @@ function ____exports.axisOf(self, id)
     end
     return vector.new(1, 0, 0)
 end
---- Распределить desired force body (Fx,Fy,Fz) + yaw torque на 16 дросселей.
--- Возвращает throttle 0..1 в порядке ECU_IDS.
--- Конвенция: f — это ДОБАВКА сверх hover (hover отдельно).
-function ____exports.mix(self, f, yaw, hover)
-    local out = {}
+--- Знак угла: +1 перед, -1 зад; +1 право, -1 лево.
+function ____exports.cornerSigns(self, id)
+    local front = __TS__StringStartsWith(id, "F") and 1 or -1
+    local right = string.sub(id, 2, 2) == "R" and 1 or -1
+    return {front, right}
+end
+--- Распределить desired force body + моменты по 16 моторам.
+-- f — добавка сверх hover. pitchT/rollT/yawT — моменты из attitude-контура.
+-- Векторы: подъёмные наклоняются коллективно в сторону горизонтальной тяги
+-- (быстрый отклик без раскрутки горизонтальных) + тангенциально для yaw.
+-- tiltSign — подкрутить если yaw закручивает не туда (команда vgain/vsign).
+function ____exports.mixFull(self, f, yawT, pitchT, rollT, hover, tiltSign, vecGain)
+    local th = {}
+    local vx = {}
+    local vy = {}
+    local tiltX = math.max(
+        -1,
+        math.min(1, f.x * 1.5 * vecGain)
+    )
+    local tiltZ = math.max(
+        -1,
+        math.min(1, f.z * 1.5 * vecGain)
+    )
+    local yawTilt = math.max(
+        -1,
+        math.min(1, yawT * 2 * vecGain)
+    ) * tiltSign
     for ____, id in ipairs(____exports.ECU_IDS) do
-        local t
         if __TS__StringEndsWith(id, "up") then
-            t = hover + f.y / 4
+            local front, right = table.unpack(____exports.cornerSigns(nil, id))
+            local t = hover + f.y / 4 - pitchT * front * 0.25 + rollT * right * 0.25
+            if t > 1 then
+                t = 1
+            end
+            if t < 0 then
+                t = 0
+            end
+            th[#th + 1] = t
+            vx[#vx + 1] = math.max(
+                -1,
+                math.min(1, tiltX - right * yawTilt * 0.7)
+            )
+            vy[#vy + 1] = math.max(
+                -1,
+                math.min(1, tiltZ + front * yawTilt * 0.7)
+            )
         elseif __TS__StringEndsWith(id, "fwd") then
-            t = math.max(0, f.z / 4) + yaw * 0.05
+            th[#th + 1] = math.max(
+                0,
+                math.min(
+                    1,
+                    math.max(0, f.z / 4) + yawT * 0.05
+                )
+            )
+            vx[#vx + 1] = 0
+            vy[#vy + 1] = 0
         elseif __TS__StringEndsWith(id, "aft") then
-            t = math.max(0, -f.z / 4) - yaw * 0.05
+            th[#th + 1] = math.max(
+                0,
+                math.min(
+                    1,
+                    math.max(0, -f.z / 4) - yawT * 0.05
+                )
+            )
+            vx[#vx + 1] = 0
+            vy[#vy + 1] = 0
         else
             local ax = ____exports.axisOf(nil, id)
-            t = math.max(0, f.x * ax.x / 4) + math.abs(yaw) * 0.03
+            th[#th + 1] = math.max(
+                0,
+                math.min(
+                    1,
+                    math.max(0, f.x * ax.x / 4) + math.abs(yawT) * 0.03
+                )
+            )
+            vx[#vx + 1] = 0
+            vy[#vy + 1] = 0
         end
-        if t > 1 then
-            t = 1
-        end
-        if t < 0 then
-            t = 0
-        end
-        out[#out + 1] = t
     end
-    return out
+    return {th = th, vx = vx, vy = vy}
+end
+--- Старый миксер без векторов (fallback).
+function ____exports.mix(self, f, yaw, hover)
+    local m = ____exports.mixFull(
+        nil,
+        f,
+        yaw,
+        0,
+        0,
+        hover,
+        1,
+        0
+    )
+    return m.th
 end
 --- Повернуть мировой вектор в body через conjugate(orientation).
 function ____exports.worldToBody(self, q, w)
@@ -207,6 +282,12 @@ function ____exports.yawError(self, qCur, qTgt)
     local dq = qTgt:mul(qCur:conjugate())
     local ____, yaw = dq:toEuler()
     return yaw
+end
+--- Вытащить pitch/roll ошибки (радианы) из кватерниона рассогласования.
+function ____exports.tiltErrors(self, qCur, qTgt)
+    local dq = qTgt:mul(qCur:conjugate())
+    local pitch, ____, roll = dq:toEuler()
+    return {pitch, roll}
 end
 return ____exports
  end,
@@ -317,10 +398,19 @@ local ____exports = {}
 ____exports.CAL_PATH = "fc_cal.json"
 function ____exports.loadCal(self, loadJson)
     local c = loadJson(nil, ____exports.CAL_PATH)
-    if c ~= nil and c.hover > 0.2 and c.hover < 5 then
-        return c
+    local out = {hover = 1, vecGain = 0.6, tiltSign = 1}
+    if c ~= nil then
+        if c.hover > 0.2 and c.hover < 5 then
+            out.hover = c.hover
+        end
+        if c.vecGain ~= nil and c.vecGain >= 0 and c.vecGain <= 2 then
+            out.vecGain = c.vecGain
+        end
+        if c.tiltSign ~= nil and (c.tiltSign == 1 or c.tiltSign == -1) then
+            out.tiltSign = c.tiltSign
+        end
     end
-    return {hover = 1}
+    return out
 end
 return ____exports
  end,
@@ -375,6 +465,24 @@ local yawPid = __TS__New(pid.Pid, {
     oMin = -0.5,
     oMax = 0.5
 })
+local pitchPid = __TS__New(pid.Pid, {
+    kp = 0.5,
+    ki = 0.03,
+    kd = 0.18,
+    iMin = -0.4,
+    iMax = 0.4,
+    oMin = -0.4,
+    oMax = 0.4
+})
+local rollPid = __TS__New(pid.Pid, {
+    kp = 0.5,
+    ki = 0.03,
+    kd = 0.18,
+    iMin = -0.4,
+    iMax = 0.4,
+    oMin = -0.4,
+    oMax = 0.4
+})
 local qHold = quaternion.identity()
 local seq = 1
 local lastLoop = os.clock()
@@ -428,7 +536,19 @@ local function loop(self)
         local fB = ctl:worldToBody(pose.orientation, forceW)
         local yawE = ctl:yawError(pose.orientation, qHold)
         local yawT = yawPid:step(0, -yawE, dt)
-        local th = ctl:mix(fB, yawT, hoverBase)
+        local pitchE, rollE = table.unpack(ctl:tiltErrors(pose.orientation, qHold))
+        local pitchT = pitchPid:step(0, -pitchE, dt)
+        local rollT = rollPid:step(0, -rollE, dt)
+        local m = ctl:mixFull(
+            fB,
+            yawT,
+            pitchT,
+            rollT,
+            hoverBase,
+            cal.tiltSign,
+            cal.vecGain
+        )
+        local th = m.th
         if fc.phase == "idle" then
             do
                 local i = 0
@@ -447,8 +567,8 @@ local function loop(self)
                     seq = seq,
                     to = ctl.ECU_IDS[i + 1],
                     throttle = th[i + 1] or 0,
-                    vecX = 0,
-                    vecY = 0
+                    vecX = m.vx[i + 1] or 0,
+                    vecY = m.vy[i + 1] or 0
                 })
                 i = i + 1
             end
@@ -519,7 +639,7 @@ local function console_(self)
             print("fc: ABORT")
         elseif c == "status" then
             local p = sublevel.getLogicalPose().position
-            print((((((((((("pos " .. tostring(p.x)) .. " ") .. tostring(p.y)) .. " ") .. tostring(p.z)) .. " phase=") .. fc.phase) .. " wp=") .. tostring(#fc.waypoints)) .. " calHover=") .. tostring(cal.hover))
+            print((((((((((((((("pos " .. tostring(p.x)) .. " ") .. tostring(p.y)) .. " ") .. tostring(p.z)) .. " phase=") .. fc.phase) .. " wp=") .. tostring(#fc.waypoints)) .. " calHover=") .. tostring(cal.hover)) .. " vec=") .. tostring(cal.vecGain)) .. " sign=") .. tostring(cal.tiltSign))
         elseif c == "calib" then
             local v = tonumber(cmd[2] or "")
             if v == nil then
@@ -532,8 +652,30 @@ local function console_(self)
                 saveCal(nil)
                 print(("calib hover=" .. tostring(cal.hover)) .. " — проверь вис, повтори при сносе")
             end
+        elseif c == "vgain" then
+            local v = tonumber(cmd[2] or "")
+            if v == nil then
+                print(("vgain " .. tostring(cal.vecGain)) .. " (0=векторы выкл, 0..2)")
+            else
+                cal.vecGain = math.max(
+                    0,
+                    math.min(2, v)
+                )
+                saveCal(nil)
+                print("vgain=" .. tostring(cal.vecGain))
+            end
+        elseif c == "vsign" then
+            cal.tiltSign = cal.tiltSign == 1 and -1 or 1
+            saveCal(nil)
+            print(("vsign=" .. tostring(cal.tiltSign)) .. " (если yaw закручивает не туда — дёрни ещё раз)")
+        elseif c == "level" then
+            qHold = sublevel.getLogicalPose().orientation
+            pitchPid:reset()
+            rollPid:reset()
+            yawPid:reset()
+            print("level: текущий горизонт принят за цель")
         elseif c == "help" or c == "?" or c == "" then
-            print("hold | hover [y] | goto x y z | route .. | abort | status | calib k")
+            print("hold | hover [y] | goto x y z | route .. | abort | status | calib k | vgain k | vsign | level")
         elseif c == "route" then
             if (#cmd - 1) % 3 ~= 0 then
                 print("usage: route x1 y1 z1 [x2 y2 z2 ...]")
