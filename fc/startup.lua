@@ -30,6 +30,17 @@ local function __TS__Class(self)
     return c
 end
 
+local function __TS__ObjectAssign(target, ...)
+    local sources = {...}
+    for i = 1, #sources do
+        local source = sources[i]
+        for key in pairs(source) do
+            target[key] = source[key]
+        end
+    end
+    return target
+end
+
 local function __TS__New(target, ...)
     local instance = setmetatable({}, target.prototype)
     instance:____constructor(...)
@@ -53,6 +64,7 @@ function Pid.prototype.____constructor(self, o)
     self.oMin = o.oMin or -1000000000
     self.oMax = o.oMax or 1000000000
     self.dAlpha = o.dAlpha or 0.35
+    self.freezeBelow = o.freezeBelow or 0
 end
 function Pid.prototype.reset(self)
     self.integral = 0
@@ -65,12 +77,15 @@ function Pid.prototype.step(self, sp, pv, dt)
         dt = 0.05
     end
     local err = sp - pv
-    self.integral = self.integral + err * dt
-    if self.integral > self.iMax then
-        self.integral = self.iMax
-    end
-    if self.integral < self.iMin then
-        self.integral = self.iMin
+    local frozen = math.abs(err) < self.freezeBelow
+    if not frozen then
+        self.integral = self.integral + err * dt
+        if self.integral > self.iMax then
+            self.integral = self.iMax
+        end
+        if self.integral < self.iMin then
+            self.integral = self.iMin
+        end
     end
     local d = 0
     if not self.first then
@@ -80,23 +95,36 @@ function Pid.prototype.step(self, sp, pv, dt)
     self.first = false
     self.prevErr = err
     self.prevD = d
-    local out = self.kp * err + self.ki * self.integral + self.kd * d
-    if out > self.oMax then
-        out = self.oMax
+    local raw = self.kp * err + self.ki * self.integral + self.kd * d
+    if raw > self.oMax and err > 0 or raw < self.oMin and err < 0 then
+        if not frozen then
+            self.integral = self.integral - err * dt
+            if self.integral > self.iMax then
+                self.integral = self.iMax
+            end
+            if self.integral < self.iMin then
+                self.integral = self.iMin
+            end
+        end
+        raw = self.kp * err + self.ki * self.integral + self.kd * d
     end
-    if out < self.oMin then
-        out = self.oMin
+    if raw > self.oMax then
+        raw = self.oMax
     end
-    return out
+    if raw < self.oMin then
+        raw = self.oMin
+    end
+    return raw
 end
 --- 3-axis vector PID built from 3 scalar Pids.
 ____exports.Pid3 = __TS__Class()
 local Pid3 = ____exports.Pid3
 Pid3.name = "Pid3"
-function Pid3.prototype.____constructor(self, o)
-    self.x = __TS__New(____exports.Pid, o)
-    self.y = __TS__New(____exports.Pid, o)
-    self.z = __TS__New(____exports.Pid, o)
+function Pid3.prototype.____constructor(self, o, extra)
+    local m = extra ~= nil and __TS__ObjectAssign({}, o, extra) or o
+    self.x = __TS__New(____exports.Pid, m)
+    self.y = __TS__New(____exports.Pid, m)
+    self.z = __TS__New(____exports.Pid, m)
 end
 function Pid3.prototype.reset(self)
     self.x:reset()
@@ -446,7 +474,7 @@ local posPid = __TS__New(pid.Pid3, {
     iMax = 2,
     oMin = -3,
     oMax = 3
-})
+}, {freezeBelow = 0.15})
 local velPid = __TS__New(pid.Pid3, {
     kp = 0.25,
     ki = 0.08,
@@ -455,7 +483,7 @@ local velPid = __TS__New(pid.Pid3, {
     iMax = 0.4,
     oMin = -0.5,
     oMax = 0.5
-})
+}, {freezeBelow = 0.05})
 local yawPid = __TS__New(pid.Pid, {
     kp = 0.8,
     ki = 0.02,
@@ -463,7 +491,8 @@ local yawPid = __TS__New(pid.Pid, {
     iMin = -0.5,
     iMax = 0.5,
     oMin = -0.5,
-    oMax = 0.5
+    oMax = 0.5,
+    freezeBelow = 0.01
 })
 local pitchPid = __TS__New(pid.Pid, {
     kp = 0.5,
@@ -472,7 +501,8 @@ local pitchPid = __TS__New(pid.Pid, {
     iMin = -0.4,
     iMax = 0.4,
     oMin = -0.4,
-    oMax = 0.4
+    oMax = 0.4,
+    freezeBelow = 0.005
 })
 local rollPid = __TS__New(pid.Pid, {
     kp = 0.5,
@@ -481,7 +511,8 @@ local rollPid = __TS__New(pid.Pid, {
     iMin = -0.4,
     iMax = 0.4,
     oMin = -0.4,
-    oMax = 0.4
+    oMax = 0.4,
+    freezeBelow = 0.005
 })
 local qHold = quaternion.identity()
 local seq = 1
@@ -598,8 +629,10 @@ local function console_(self)
             fc.target = nil
             fc.waypoints = {}
             saveFc(nil)
+            posPid:reset()
+            velPid:reset()
             modem.transmit(proto.CH_MISSION, proto.CH_MISSION, {kind = "hold", to = "all"})
-            print("fc: HOLD")
+            print("fc: HOLD (integrators reset)")
         elseif c == "hover" then
             local y = tonumber(cmd[2] or "") or 400
             local p = sublevel.getLogicalPose().position
@@ -607,8 +640,10 @@ local function console_(self)
             fc.target = {x = p.x, y = y, z = p.z}
             fc.waypoints = {}
             saveFc(nil)
+            posPid:reset()
+            velPid:reset()
             modem.transmit(proto.CH_MISSION, proto.CH_MISSION, {kind = "hover_alt", altY = y, to = "all"})
-            print("fc: HOVER y=" .. tostring(y))
+            print(("fc: HOVER y=" .. tostring(y)) .. " (integrators reset)")
         elseif c == "goto" then
             local x = tonumber(cmd[2] or "")
             local y = tonumber(cmd[3] or "")
@@ -621,6 +656,8 @@ local function console_(self)
                 fc.waypoints = {{x = p.x, y = fc.cruiseAlt, z = p.z}, {x = x, y = fc.cruiseAlt, z = z}, {x = x, y = y, z = z}}
                 fc.target = {x = x, y = y, z = z}
                 saveFc(nil)
+                posPid:reset()
+                velPid:reset()
                 modem.transmit(proto.CH_MISSION, proto.CH_MISSION, {
                     kind = "goto",
                     x = x,
@@ -628,15 +665,20 @@ local function console_(self)
                     z = z,
                     to = "all"
                 })
-                print((((((("fc: GOTO " .. tostring(x)) .. " ") .. tostring(y)) .. " ") .. tostring(z)) .. " via ") .. tostring(fc.cruiseAlt))
+                print(((((((("fc: GOTO " .. tostring(x)) .. " ") .. tostring(y)) .. " ") .. tostring(z)) .. " via ") .. tostring(fc.cruiseAlt)) .. " (integrators reset)")
             end
         elseif c == "abort" then
             fc.phase = "idle"
             fc.target = nil
             fc.waypoints = {}
             saveFc(nil)
+            posPid:reset()
+            velPid:reset()
+            yawPid:reset()
+            pitchPid:reset()
+            rollPid:reset()
             modem.transmit(proto.CH_MISSION, proto.CH_MISSION, {kind = "abort", to = "all"})
-            print("fc: ABORT")
+            print("fc: ABORT (integrators reset)")
         elseif c == "status" then
             local p = sublevel.getLogicalPose().position
             print((((((((((((((("pos " .. tostring(p.x)) .. " ") .. tostring(p.y)) .. " ") .. tostring(p.z)) .. " phase=") .. fc.phase) .. " wp=") .. tostring(#fc.waypoints)) .. " calHover=") .. tostring(cal.hover)) .. " vec=") .. tostring(cal.vecGain)) .. " sign=") .. tostring(cal.tiltSign))
@@ -675,7 +717,7 @@ local function console_(self)
             yawPid:reset()
             print("level: текущий горизонт принят за цель")
         elseif c == "help" or c == "?" or c == "" then
-            print("hold | hover [y] | goto x y z | route .. | abort | status | calib k | vgain k | vsign | level")
+            print("hold|hover|goto|route|abort|status|calib|vgain|vsign|level|ireset")
         elseif c == "route" then
             if (#cmd - 1) % 3 ~= 0 then
                 print("usage: route x1 y1 z1 [x2 y2 z2 ...]")
@@ -696,9 +738,18 @@ local function console_(self)
                 fc.waypoints = pts
                 fc.target = pts[#pts]
                 saveFc(nil)
+                posPid:reset()
+                velPid:reset()
                 modem.transmit(proto.CH_MISSION, proto.CH_MISSION, {kind = "route", points = pts, to = "all"})
-                print("fc: ROUTE " .. tostring(#pts))
+                print(("fc: ROUTE " .. tostring(#pts)) .. " (integrators reset)")
             end
+        elseif c == "ireset" then
+            posPid:reset()
+            velPid:reset()
+            yawPid:reset()
+            pitchPid:reset()
+            rollPid:reset()
+            print("fc: integrators zeroed")
         else
             print("unknown: " .. c)
         end
